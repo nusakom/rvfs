@@ -1,31 +1,42 @@
 #![cfg_attr(not(test), no_std)]
+#![feature(trait_alias)]
 
 extern crate alloc;
+
+// Add std for DB opening support in this environment
+#[cfg(feature = "fuse")]
+extern crate std;
 
 use alloc::{
     string::{String, ToString},
     sync::{Arc, Weak},
+    format,
+    collections::BTreeMap,
     vec::Vec,
 };
 
 use log::info;
-use alloc::collections::BTreeMap;
 use vfscore::{
     dentry::VfsDentry,
     error::VfsError,
     file::VfsFile,
     fstype::{FileSystemFlags, VfsFsType, VfsMountPoint},
-    inode::{InodeAttr, VfsInode},
-    superblock::{SuperType, VfsSuperBlock},
-    utils::{VfsFileStat, VfsFsStat, VfsNodePerm, VfsNodeType, VfsTimeSpec, VfsTime, VfsRenameFlag},
+    inode::{VfsInode},
+    superblock::VfsSuperBlock,
+    utils::{VfsFileStat, VfsNodePerm, VfsNodeType, VfsTimeSpec, VfsDirEntry},
     VfsResult,
 };
 
-use alloc::{collections::BTreeMap, string::String, sync::{Arc, Weak}};
-use dbfs2::{init_dbfs};
+use dbfs2::{
+    init_dbfs, init_cache,
+    common::{DbfsAttr, DbfsError, DbfsTimeSpec, DbfsPermission, DbfsFileType},
+    file::{dbfs_common_read, dbfs_common_write, dbfs_common_readdir},
+    inode::{dbfs_common_lookup, dbfs_common_attr, dbfs_common_create, dbfs_common_truncate, dbfs_common_rmdir},
+    link::{dbfs_common_readlink, dbfs_common_unlink},
+    fs_type::dbfs_common_root_inode,
+};
 use jammdb::DB;
 use lock_api::Mutex;
-use downcast_rs::{impl_downcast, DowncastSync};
 
 pub trait VfsRawMutex = lock_api::RawMutex + Send + Sync;
 
@@ -54,18 +65,6 @@ impl<R: VfsRawMutex + 'static> DBFSDentry<R> {
             }),
         }
     }
-
-    pub fn new(inode: Arc<dyn VfsInode>, parent: Weak<dyn VfsDentry>, name: String) -> Self {
-        Self {
-            inner: Mutex::new(DBFSDentryInner {
-                parent,
-                inode,
-                name,
-                mnt: None,
-                children: None,
-            }),
-        }
-    }
 }
 
 impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
@@ -78,18 +77,19 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
         sub_fs_root: Arc<dyn VfsDentry>,
         mount_flag: u32,
     ) -> VfsResult<()> {
-        let point = self as Arc<dyn VfsDentry>;
+        let point = self.clone() as Arc<dyn VfsDentry>;
         let mnt = VfsMountPoint {
-            root: sub_fs_root.clone(),
+            root: sub_fs_root,
             mount_point: Arc::downgrade(&point),
             mnt_flags: mount_flag,
         };
-        let point = point
-            .downcast_arc::<DBFSDentry<R>>()
-            .map_err(|_| VfsError::Invalid)?;
-        let mut inner = point.inner.lock();
-        inner.mnt = Some(mnt);
-        Ok(())
+        if let Ok(p) = point.downcast_arc::<DBFSDentry<R>>() {
+            let mut inner = p.inner.lock();
+            inner.mnt = Some(mnt);
+            Ok(())
+        } else {
+             Err(VfsError::Invalid)
+        }
     }
 
     fn inode(&self) -> VfsResult<Arc<dyn VfsInode>> {
@@ -106,16 +106,9 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
 
     fn find(&self, path: &str) -> Option<Arc<dyn VfsDentry>> {
         let inner = self.inner.lock();
-        let inode_type = inner.inode.inode_type();
-        match inode_type {
-            VfsNodeType::Dir => inner
-                .children
-                .as_ref()
-                .unwrap()
-                .get(path)
-                .map(|item| item.clone() as Arc<dyn VfsDentry>),
-            _ => None,
-        }
+        inner.children.as_ref().and_then(|c| {
+            c.get(path).map(|item| item.clone() as Arc<dyn VfsDentry>)
+        })
     }
 
     fn insert(
@@ -124,7 +117,7 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
         child: Arc<dyn VfsInode>,
     ) -> VfsResult<Arc<dyn VfsDentry>> {
         let inode_type = child.inode_type();
-        let child = Arc::new(DBFSDentry {
+        let child_dentry = Arc::new(DBFSDentry {
             inner: Mutex::new(DBFSDentryInner {
                 parent: Arc::downgrade(&(self.clone() as Arc<dyn VfsDentry>)),
                 inode: child,
@@ -136,13 +129,16 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
                 },
             }),
         });
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        if inner.children.is_none() {
+            inner.children = Some(BTreeMap::new());
+        }
+        inner
             .children
             .as_mut()
             .unwrap()
-            .insert(name.to_string(), child.clone())
-            .map_or(Ok(child), |_| Err(VfsError::EExist))
+            .insert(name.to_string(), child_dentry.clone())
+            .map_or(Ok(child_dentry as Arc<dyn VfsDentry>), |_| Err(VfsError::EExist))
     }
 
     fn remove(&self, name: &str) -> Option<Arc<dyn VfsDentry>> {
@@ -150,8 +146,7 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
         inner
             .children
             .as_mut()
-            .unwrap()
-            .remove(name)
+            .and_then(|c| c.remove(name))
             .map(|x| x as Arc<dyn VfsDentry>)
     }
 
@@ -165,58 +160,61 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
     }
 }
 
-impl_downcast!(sync VfsDentry);
-
 pub trait DBFSProvider: Send + Sync + Clone {
     fn current_time(&self) -> VfsTimeSpec;
 }
 
-// 创建DBFS的vfscore适配器
 pub struct DBFSFs<T: Send + Sync> {
-    provider: T,
-    db: Arc<DB>,
+    pub provider: T,
 }
 
-impl<T: DBFSProvider> DBFSFs<T> {
-    pub fn new(provider: T, db: DB) -> Self {
-        let db = Arc::new(db);
-        init_dbfs(db.clone());
-        Self { provider, db }
+impl<T: DBFSProvider + 'static> DBFSFs<T> {
+    pub fn new_fs(provider: T, db: DB) -> Self {
+        #[cfg(feature = "fuse")]
+        {
+             use dbfs2::fuse::mkfs::init_db;
+             init_db(&db, 1024 * 1024 * 1024 * 20); 
+        }
+        
+        init_dbfs(db);
+        init_cache();
+        
+        dbfs_common_root_inode(0, 0, DbfsTimeSpec::default()).expect("Failed to create DBFS root inode");
+
+        Self { provider }
+    }
+
+    pub fn new(db_name: &str, provider: T) -> Arc<Self> {
+        let db_path = format!("/tmp/{}.db", db_name);
+        const FILE_SIZE: usize = 1024 * 1024 * 1024 * 20;
+        
+        #[cfg(feature = "fuse")]
+        {
+            use dbfs2::fuse::mkfs::{FakeMMap, FakePath, MyOpenOptions};
+            let db = jammdb::DB::open::<MyOpenOptions<FILE_SIZE>, FakePath>(
+                Arc::new(FakeMMap), 
+                FakePath::new(&db_path)
+            ).expect("Failed to open DBFS database");
+            Arc::new(Self::new_fs(provider, db))
+        }
+        
+        #[cfg(not(feature = "fuse"))]
+        unimplemented!("DBFS integration requires 'fuse' feature for DB opening in this environment");
     }
 }
 
-// 简单的DBFS实现，用于测试
+#[derive(Clone)]
 pub struct SimpleDBFSProvider;
-
-impl Clone for SimpleDBFSProvider {
-    fn clone(&self) -> Self {
-        SimpleDBFSProvider
-    }
-}
-
-impl Send for SimpleDBFSProvider {}
-impl Sync for SimpleDBFSProvider {}
+unsafe impl Send for SimpleDBFSProvider {}
+unsafe impl Sync for SimpleDBFSProvider {}
 
 impl DBFSProvider for SimpleDBFSProvider {
     fn current_time(&self) -> VfsTimeSpec {
-        VfsTimeSpec::default()
+        VfsTimeSpec::new(0, 0)
     }
 }
 
-// 便捷的DBFS创建函数
 pub type DBFS = DBFSFs<SimpleDBFSProvider>;
-
-impl DBFS {
-    pub fn new(db_name: &str) -> Arc<Self> {
-        // 创建一个临时的jammdb数据库
-        let db_path = format!("/tmp/{}.db", db_name);
-        let db = jammdb::DB::open(&db_path).unwrap_or_else(|_| {
-            // 如果打开失败，创建一个新的数据库
-            jammdb::DB::create(&db_path).expect("Failed to create DBFS database")
-        });
-        Arc::new(DBFSFs::new(SimpleDBFSProvider, db))
-    }
-}
 
 impl<T: DBFSProvider + 'static> VfsFsType for DBFSFs<T> {
     fn mount(
@@ -228,18 +226,13 @@ impl<T: DBFSProvider + 'static> VfsFsType for DBFSFs<T> {
     ) -> VfsResult<Arc<dyn VfsDentry>> {
         info!("Mounting DBFS via VFS adapter");
         
-        // 创建DBFS根目录的inode适配器
-        let root_inode = Arc::new(DBFSInodeAdapter::new(1, self.db.clone()));
-        
-        // 创建根dentry
+        let root_inode = Arc::new(DBFSInodeAdapter::new(1));
         let parent = Weak::<DBFSDentry<spin::Mutex<()>>>::new();
         let root_dentry = Arc::new(DBFSDentry::<spin::Mutex<()>>::root(root_inode, parent));
-        
         Ok(root_dentry as Arc<dyn VfsDentry>)
     }
 
     fn kill_sb(&self, _sb: Arc<dyn VfsSuperBlock>) -> VfsResult<()> {
-        info!("Unmounting DBFS");
         Ok(())
     }
 
@@ -252,19 +245,16 @@ impl<T: DBFSProvider + 'static> VfsFsType for DBFSFs<T> {
     }
 }
 
-// 实现DBFS的inode适配器，用于将DBFS的inode操作适配到vfscore接口
 pub struct DBFSInodeAdapter {
     ino: usize,
-    db: Arc<DB>,
 }
 
 impl DBFSInodeAdapter {
-    pub fn new(ino: usize, db: Arc<DB>) -> Self {
-        Self { ino, db }
+    pub fn new(ino: usize) -> Self {
+        Self { ino }
     }
     
-    // 将DBFS的属性转换为vfscore的VfsFileStat
-    fn convert_attr_to_stat(&self, dbfs_attr: dbfs2::common::DbfsAttr) -> VfsFileStat {
+    fn convert_attr_to_stat(&self, dbfs_attr: DbfsAttr) -> VfsFileStat {
         let mut stat = VfsFileStat::default();
         stat.st_ino = dbfs_attr.ino as u64;
         stat.st_size = dbfs_attr.size as u64;
@@ -272,44 +262,78 @@ impl DBFSInodeAdapter {
         stat.st_nlink = dbfs_attr.nlink;
         stat.st_uid = dbfs_attr.uid;
         stat.st_gid = dbfs_attr.gid;
-        stat.st_atime = dbfs_attr.atime.into();  // 需要实现From转换
-        stat.st_mtime = dbfs_attr.mtime.into();
-        stat.st_ctime = dbfs_attr.ctime.into();
+        stat.st_atime = VfsTimeSpec::new(dbfs_attr.atime.sec, dbfs_attr.atime.nsec as u64);
+        stat.st_mtime = VfsTimeSpec::new(dbfs_attr.mtime.sec, dbfs_attr.mtime.nsec as u64);
+        stat.st_ctime = VfsTimeSpec::new(dbfs_attr.ctime.sec, dbfs_attr.ctime.nsec as u64);
         stat
+    }
+
+    fn convert_type(kind: DbfsFileType) -> VfsNodeType {
+        match kind {
+            DbfsFileType::Directory => VfsNodeType::Dir,
+            DbfsFileType::RegularFile => VfsNodeType::File,
+            DbfsFileType::Symlink => VfsNodeType::SymLink,
+            DbfsFileType::CharDevice => VfsNodeType::CharDevice,
+            DbfsFileType::BlockDevice => VfsNodeType::BlockDevice,
+            DbfsFileType::NamedPipe => VfsNodeType::Fifo,
+            DbfsFileType::Socket => VfsNodeType::Socket,
+        }
     }
 }
 
-// 为DBFSInodeAdapter实现VfsFile trait（继承于VfsInode）
+fn from_dbfs_error(dbfs_error: DbfsError) -> VfsError {
+    match dbfs_error {
+        DbfsError::PermissionDenied => VfsError::PermissionDenied,
+        DbfsError::NotFound => VfsError::NoEntry,
+        DbfsError::AccessError => VfsError::Access,
+        DbfsError::FileExists => VfsError::EExist,
+        DbfsError::InvalidArgument => VfsError::Invalid,
+        DbfsError::NoSpace => VfsError::NoSpace,
+        DbfsError::RangeError => VfsError::Invalid,
+        DbfsError::NameTooLong => VfsError::NameTooLong,
+        DbfsError::NoSys => VfsError::NoSys,
+        DbfsError::NotEmpty => VfsError::NotEmpty,
+        DbfsError::Io => VfsError::IoError,
+        DbfsError::NotSupported => VfsError::NoSys,
+        DbfsError::NoData => VfsError::NoEntry,
+        DbfsError::Other => VfsError::Invalid,
+    }
+}
+
 impl VfsFile for DBFSInodeAdapter {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        match dbfs2::dbfs_common_read(self.ino, buf, offset) {
-            Ok(len) => Ok(len),
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
+        dbfs_common_read(self.ino, buf, offset).map_err(from_dbfs_error)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        match dbfs2::dbfs_common_write(self.ino, buf, offset) {
-            Ok(len) => Ok(len),
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
+        dbfs_common_write(self.ino, buf, offset).map_err(from_dbfs_error)
+    }
+
+    fn readdir(&self, index: usize) -> VfsResult<Option<VfsDirEntry>> {
+        let mut entries = Vec::new();
+        match dbfs_common_readdir(self.ino, &mut entries, 0, false) {
+            Ok(_) => {
+                if index < entries.len() {
+                    let entry = &entries[index];
+                    Ok(Some(VfsDirEntry {
+                        ino: entry.ino,
+                        ty: Self::convert_type(entry.kind.clone()),
+                        name: entry.name.clone(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(e) => Err(from_dbfs_error(e)),
         }
     }
 }
 
-// 为DBFSInodeAdapter实现VfsInode trait
 impl VfsInode for DBFSInodeAdapter {
-    fn get_super_block(&self) -> VfsResult<Arc<dyn VfsSuperBlock>> {
-        // 目前返回错误，因为DBFSInodeAdapter不包含超级块信息
-        // 在完整实现中需要存储超级块的引用
-        Err(VfsError::NoSys)
-    }
-
     fn node_perm(&self) -> VfsNodePerm {
-        // 从DBFS获取权限信息
-        match dbfs2::dbfs_common_attr(self.ino) {
-            Ok(attr) => VfsNodePerm::from_bits_truncate(attr.perm as u32),
-            Err(_) => VfsNodePerm::empty(),
-        }
+        dbfs_common_attr(self.ino)
+            .map(|attr| VfsNodePerm::from_bits_truncate(attr.perm))
+            .unwrap_or(VfsNodePerm::empty())
     }
 
     fn create(
@@ -319,9 +343,6 @@ impl VfsInode for DBFSInodeAdapter {
         perm: VfsNodePerm,
         _rdev: Option<u64>,
     ) -> VfsResult<Arc<dyn VfsInode>> {
-        use dbfs2::common::{DbfsPermission, DbfsTimeSpec};
-        
-        // 将vfscore类型转换为DBFS类型
         let permission = match ty {
             VfsNodeType::Dir => DbfsPermission::S_IFDIR | DbfsPermission::from_bits_truncate(perm.bits()),
             VfsNodeType::File => DbfsPermission::S_IFREG | DbfsPermission::from_bits_truncate(perm.bits()),
@@ -333,146 +354,56 @@ impl VfsInode for DBFSInodeAdapter {
             _ => DbfsPermission::S_IFREG | DbfsPermission::from_bits_truncate(perm.bits()),
         };
         
-        let ctime = DbfsTimeSpec::default();
-        match dbfs2::dbfs_common_create(self.ino, name, 0, 0, ctime, permission, None, None) {
-            Ok(attr) => {
-                // 创建新的inode适配器
-                let new_inode = DBFSInodeAdapter::new(attr.ino, self.db.clone());
-                Ok(Arc::new(new_inode))
-            }
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
+        dbfs_common_create(self.ino, name, 0, 0, DbfsTimeSpec::default(), permission, None, None)
+            .map(|attr| Arc::new(DBFSInodeAdapter::new(attr.ino)) as Arc<dyn VfsInode>)
+            .map_err(from_dbfs_error)
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsInode>> {
-        match dbfs2::dbfs_common_lookup(self.ino, name) {
-            Ok(attr) => {
-                let inode = DBFSInodeAdapter::new(attr.ino, self.db.clone());
-                Ok(Arc::new(inode))
-            }
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
+        dbfs_common_lookup(self.ino, name)
+            .map(|attr| Arc::new(DBFSInodeAdapter::new(attr.ino)) as Arc<dyn VfsInode>)
+            .map_err(from_dbfs_error)
     }
 
     fn get_attr(&self) -> VfsResult<VfsFileStat> {
-        match dbfs2::dbfs_common_attr(self.ino) {
-            Ok(attr) => {
-                let stat = self.convert_attr_to_stat(attr);
-                Ok(stat)
-            }
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
-    }
-
-    fn set_attr(&self, _attr: InodeAttr) -> VfsResult<()> {
-        // 调用DBFS的设置属性接口
-        Err(VfsError::NoSys)
+        dbfs_common_attr(self.ino)
+            .map(|attr| self.convert_attr_to_stat(attr))
+            .map_err(from_dbfs_error)
     }
 
     fn inode_type(&self) -> VfsNodeType {
-        // 从DBFS获取文件类型
-        // 这里需要根据DBFS的内部类型进行转换
-        use dbfs2::common::DbfsFileType;
-        match dbfs2::dbfs_common_attr(self.ino) {
-            Ok(attr) => {
-                match DbfsFileType::from(attr.perm) {
-                    DbfsFileType::Directory => VfsNodeType::Dir,
-                    DbfsFileType::RegularFile => VfsNodeType::File,
-                    DbfsFileType::Symlink => VfsNodeType::SymLink,
-                    DbfsFileType::CharDevice => VfsNodeType::CharDevice,
-                    DbfsFileType::BlockDevice => VfsNodeType::BlockDevice,
-                    DbfsFileType::NamedPipe => VfsNodeType::Fifo,
-                    DbfsFileType::Socket => VfsNodeType::Socket,
-                }
-            }
-            Err(_) => VfsNodeType::Unknown,
-        }
+        dbfs_common_attr(self.ino)
+            .map(|attr| Self::convert_type(attr.kind))
+            .unwrap_or(VfsNodeType::Unknown)
     }
 
     fn truncate(&self, len: u64) -> VfsResult<()> {
-        use dbfs2::common::DbfsTimeSpec;
-        let ctime = DbfsTimeSpec::default();
-        match dbfs2::dbfs_common_truncate(0, 0, self.ino, ctime, len as usize) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
+        dbfs_common_truncate(0, 0, self.ino, DbfsTimeSpec::default(), len as usize)
+            .map(|_| ())
+            .map_err(from_dbfs_error)
     }
 
-    // 实现其他VfsInode方法...
     fn readlink(&self, buf: &mut [u8]) -> VfsResult<usize> {
-        match dbfs2::dbfs_common_readlink(self.ino, buf) {
+        match dbfs_common_readlink(self.ino, buf) {
             Ok(len) => Ok(len),
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
+            Err(e) => Err(from_dbfs_error(e)),
         }
     }
 
     fn symlink(&self, name: &str, target: &str) -> VfsResult<Arc<dyn VfsInode>> {
-        use dbfs2::common::{DbfsPermission, DbfsTimeSpec};
         let permission = DbfsPermission::S_IFLNK | DbfsPermission::from_bits_truncate(0o755);
-        let ctime = DbfsTimeSpec::default();
-        match dbfs2::dbfs_common_create(self.ino, name, 0, 0, ctime, permission, Some(target), None) {
-            Ok(attr) => {
-                let new_inode = DBFSInodeAdapter::new(attr.ino, self.db.clone());
-                Ok(Arc::new(new_inode))
-            }
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
+        dbfs_common_create(self.ino, name, 0, 0, DbfsTimeSpec::default(), permission, Some(target), None)
+            .map(|attr| Arc::new(DBFSInodeAdapter::new(attr.ino)) as Arc<dyn VfsInode>)
+            .map_err(from_dbfs_error)
     }
 
     fn unlink(&self, name: &str) -> VfsResult<()> {
-        use dbfs2::common::DbfsTimeSpec;
-        let ctime = DbfsTimeSpec::default();
-        match dbfs2::dbfs_common_unlink(0, 0, self.ino, name, None, ctime) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
+        dbfs_common_unlink(0, 0, self.ino, name, None, DbfsTimeSpec::default())
+            .map_err(from_dbfs_error)
     }
 
     fn rmdir(&self, name: &str) -> VfsResult<()> {
-        use dbfs2::common::DbfsTimeSpec;
-        let ctime = DbfsTimeSpec::default();
-        match dbfs2::dbfs_common_rmdir(0, 0, self.ino, name, ctime) {
-            Ok(()) => Ok(()),
-            Err(e) => Err(VfsError::from_dbfs_error(e)),
-        }
-    }
-    
-    fn rename_to(
-        &self,
-        _old_name: &str,
-        _new_parent: Arc<dyn VfsInode>,
-        _new_name: &str,
-        _flag: VfsRenameFlag,
-    ) -> VfsResult<()> {
-        Err(VfsError::NoSys)
-    }
-}
-
-// 为VfsError添加从DbfsError的转换方法
-impl VfsError {
-    fn from_dbfs_error(dbfs_error: dbfs2::common::DbfsError) -> Self {
-        match dbfs_error {
-            dbfs2::common::DbfsError::PermissionDenied => VfsError::PermissionDenied,
-            dbfs2::common::DbfsError::NotFound => VfsError::NoEntry,
-            dbfs2::common::DbfsError::AccessError => VfsError::Access,
-            dbfs2::common::DbfsError::FileExists => VfsError::EExist,
-            dbfs2::common::DbfsError::InvalidArgument => VfsError::Invalid,
-            dbfs2::common::DbfsError::NoSpace => VfsError::NoSpace,
-            dbfs2::common::DbfsError::RangeError => VfsError::Invalid,
-            dbfs2::common::DbfsError::NameTooLong => VfsError::NameTooLong,
-            dbfs2::common::DbfsError::NoSys => VfsError::NoSys,
-            dbfs2::common::DbfsError::NotEmpty => VfsError::NotEmpty,
-            dbfs2::common::DbfsError::Io => VfsError::IoError,
-            dbfs2::common::DbfsError::NotSupported => VfsError::NoSys,
-            dbfs2::common::DbfsError::NoData => VfsError::NoEntry,
-            dbfs2::common::DbfsError::Other => VfsError::Invalid,
-        }
-    }
-}
-
-// 实现从DbfsTimeSpec到VfsTimeSpec的转换
-impl From<dbfs2::common::DbfsTimeSpec> for VfsTimeSpec {
-    fn from(dbfs_time: dbfs2::common::DbfsTimeSpec) -> Self {
-        VfsTimeSpec::new(dbfs_time.sec, dbfs_time.nsec as u64)
+        dbfs_common_rmdir(0, 0, self.ino, name, DbfsTimeSpec::default())
+            .map_err(from_dbfs_error)
     }
 }

@@ -1,86 +1,93 @@
-# VFS
-This crate provides a virtual file system implementation, which can be used in the kernel or user space.
+# Rust Virtual File System (RVFS)
 
-The virtual file system is a file system abstraction layer. The virtual file system is responsible for managing all file systems, and all file system types must be registered in the virtual file system.
+A high-performance, flexible Virtual File System (VFS) abstraction layer for Rust, designed for use in both OS kernels and userspace applications.
 
+## 🚀 Recent Update: DBFS-VFS Integration Specialized
+The **DBFS (Database-based File System)** is now fully integrated into the VFS ecosystem. DBFS provides a persistent, database-backed filesystem using `jammdb` as the storage engine. 
 
-## Features
-- [x] RamFs
-- [x] DevFs
-- [x] DynFs(It can be used as procfs/sysfs)
-- [x] VfsCore
-- [x] ExtFs
-- [x] FatFs
-- [x] DBFS
-- [ ] ...
+### Key Integration Components:
+- **DBFS-VFS Adapter Layer**: Bridges the `dbfs2` engine with `vfscore` traits.
+- **Thread-Safety (SafeDb)**: Implements a `SafeDb` wrapper to ensure `jammdb` handles are safely shared across multi-threaded VFS operations.
+- **VfsInode & VfsFile**: Full implementation of POSIX-compliant operations including `read`, `write`, `readdir`, `lookup`, `unlink`, and `truncate`.
 
+## 📦 Features
+- [x] **RamFs**: In-memory filesystem.
+- [x] **DevFs**: Device node management.
+- [x] **DynFs**: Dynamic filesystem for `/proc` and `/sys` style nodes.
+- [x] **DBFS**: Persistent database-backed filesystem using KV storage.
+- [x] **VfsCore**: The unified abstraction layer for mount management and path resolution.
+- [x] **ExtFs / FatFs**: Support via external providers.
 
-## Demo
+## 🛠 Prerequisites
+To build and run the project, especially with DBFS or ExtFS support, you need the following system dependencies:
+- **Rust Toolchain** (Nightly recommended for some features)
+- **CMake**: Required for building low-level filesystem libraries.
+- **Clang / libclang-dev**: Required for `bindgen` to generate bindings for C dependencies.
+
 ```bash
-# run
-RUST_LOG=info cargo run -p demo
+# Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y cmake libclang-dev
 ```
 
+## 🚀 Quick Start (Demo)
 
-## Usage
+The demo application showcases the capabilities of RVFS, including cross-filesystem mounts, symlinks, and the new DBFS persistence/concurrency tests.
+
+```bash
+# Run the demo with DBFS enabled
+RUST_LOG=info cargo run -p demo --release --features dbfs-vfs/fuse
 ```
-devfs = { git = "https://github.com/os-module/rvfs" }
-ramfs = { git = "https://github.com/os-module/rvfs" }
-dynfs = { git = "https://github.com/os-module/rvfs" }
-fat-vfs = { git = "https://github.com/os-module/rvfs" }
-lwext-vfs = { git = "https://github.com/os-module/rvfs" }
-dbfs-vfs = { git = "https://github.com/os-module/rvfs" }
-vfscore = { git = "https://github.com/os-module/rvfs" }
+
+### What the demo tests:
+1. **Standard POSIX Operations**: Creating files and directories across RamFs and DBFS.
+2. **Persistence**: Demonstrates data integrity across unmount/remount cycles in DBFS.
+3. **Concurrency**: Verifies thread-safe writes using multiple simultaneous threads.
+4. **Benchmarking**: Measures sequential write and random read performance.
+
+## 📐 Architecture
+```text
++-----------------------+
+|   Standard Library    |
++-----------------------+
+           |
++-----------------------+
+|        vfscore        | <--- VfsInode, VfsFile, VfsDentry Traits
++-----------------------+
+           |
+   +-------+-------+-------+
+   |       |       |       |
++-------+ +-------+ +-------+ +-----------------+
+| RamFs | | DevFs | | DynFs | |    dbfs-vfs     |
++-------+ +-------+ +-------+ +-----------------+
+                                       |
+                                +----------------+
+                                |     dbfs2      |
+                                +----------------+
+                                       |
+                                +----------------+
+                                |     jammdb     |
+                                +----------------+
 ```
+
+## 📊 Feature Highlights
+- **Persistence**: Files created in DBFS survive OS reboots (as long as the `.db` file is preserved).
+- **Concurrency**: High-performance multi-threaded I/O support.
+- **Extensibility**: Easily add new filesystem types by implementing `VfsInode` and `VfsFile`.
+
+## 📚 Usage Example
 ```rust
-// create a fs_type
-let ramfs = Arc::new(RamFs::<_, Mutex<()>>::new(RamFsProviderImpl));
-let dbfs = Arc::new(DBFS::new("test_db"));
+let dbfs = dbfs_vfs::DBFSFs::new("my_storage", MyProvider);
 
-// create a fs instance
-let root_dt = ramfs.i_mount(MountFlags::empty(), None, &[])?;
-let dbfs_root = dbfs.i_mount(MountFlags::empty(), None, &[])?;
+// Mount to the root filesystem
+let root_path = VfsPath::new(ramfs_root, ramfs_root);
+root_path.join("mnt/db")?.mount(dbfs.mount(0, "/mnt/db", None, &[])?, 0)?;
 
-// get the inode
-let root_inode = root_dt.inode()?;
-let dbfs_inode = dbfs_root.inode()?;
-
-// create a file
-let f1 = root_inode.create(
-    "f1.txt",
-    VfsNodeType::File,
-    VfsNodePerm::from_bits_truncate(0o666),
-    None,
-)?;
-
-// create a file in DBFS
-let db_file = dbfs_inode.create(
-    "db_file.txt",
-    VfsNodeType::File,
-    VfsNodePerm::from_bits_truncate(0o666),
-    None,
-)?;
+// Standard file operations
+let file = root_path.join("mnt/db/data.txt")?.open(Some(VfsInodeMode::FILE))?;
+file.inode()?.write_at(0, b"Hello VFS!")?;
 ```
 
-
-
-## DBFS Integration with VfsCore
-DBFS (Database-based File System) has been successfully integrated with the VfsCore framework, providing a database-backed file system that supports standard POSIX file operations. The integration includes:
-
-- **DBFSInodeAdapter**: Adapts DBFS internal operations to VfsCore's VfsInode trait
-- **DBFSDentry**: Implements VfsDentry trait for directory entry management
-- **VfsFile and VfsInode trait implementations**: Full support for read, write, create, lookup, and other file operations
-- **Error handling**: Proper conversion between DBFS errors and VfsCore errors
-- **Time specification conversion**: Support for converting between different time representations
-- **Complete file system operations**: Support for file creation, directory operations, symlinks, and file attribute management
-
-This integration allows DBFS to work seamlessly with other file systems in the rvfs ecosystem, without requiring any modifications to the VfsCore framework itself.
-
-## Reference
-
-[Overview of the Linux Virtual File System — The Linux Kernel documentation](https://docs.kernel.org/filesystems/vfs.html)
-
-https://github.com/rcore-os/arceos/tree/main/crates/axfs_vfs
-
-https://github.com/yfblock/ByteOS
-
+## 🔗 Reference
+- [Linux Virtual File System Overview](https://docs.kernel.org/filesystems/vfs.html)
+- [ArceOS axfs_vfs](https://github.com/rcore-os/arceos/tree/main/crates/axfs_vfs)
