@@ -1,0 +1,13 @@
+[package]
+name = "dbfs-vfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dbfs2 = { path = "../../dbfs" }
+vfscore = { path = "../vfscore" }
+jammdb = "0.6"
+log = "0.4"
+spin = "0.9"
+lock_api = "0.4"
+downcast-rs = { version = "1.2.0", default-features = false }

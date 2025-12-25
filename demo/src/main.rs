@@ -4,6 +4,7 @@ use std::{collections::HashMap, error::Error, ops::Index, sync::Arc};
 
 use ::devfs::DevFs;
 use ::ramfs::RamFs;
+use dbfs_vfs::DBFS;
 use dynfs::DynFs;
 use log::info;
 use lwext4_vfs::{ExtFs, ExtFsType};
@@ -17,12 +18,14 @@ use vfscore::{
 };
 
 use crate::{
+    dbfs::{init_dbfs, DBFSProviderImpl},
     devfs::{init_devfs, DevFsKernelProviderImpl},
     extfs::{init_extfs, ExtFsProviderImpl},
     procfs::{init_procfs, DynFsKernelProviderImpl, ProcFsDirInodeImpl, ProcessInfo},
     ramfs::{init_ramfs, RamFsProviderImpl},
 };
 
+mod dbfs;
 mod devfs;
 mod extfs;
 mod procfs;
@@ -38,6 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let procfs_root = init_procfs(FS.lock().index("procfs").clone())?;
     let devfs_root = init_devfs(FS.lock().index("devfs").clone())?;
     let extfs_root = init_extfs(FS.lock().index("extfs").clone())?;
+    let dbfs_root = init_dbfs(FS.lock().index("dbfs").clone())?;
     ramfs_root
         .inode()?
         .create("proc", VfsNodeType::Dir, "rwxr-xr-x".into(), None)?;
@@ -47,10 +51,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     ramfs_root
         .inode()?
         .create("ext", VfsNodeType::Dir, "rwxr-xr-x".into(), None)?;
+    ramfs_root
+        .inode()?
+        .create("db", VfsNodeType::Dir, "rwxr-xr-x".into(), None)?;
     let path = VfsPath::new(ramfs_root.clone(), ramfs_root.clone());
     path.join("proc")?.mount(procfs_root, 0)?;
     path.join("dev")?.mount(devfs_root, 0)?;
     path.join("ext")?.mount(extfs_root, 0)?;
+    path.join("db")?.mount(dbfs_root, 0)?;
     let test1_path = path.join("/d1/test1.txt")?;
 
     let dt1 = test1_path.open(Some(
@@ -63,6 +71,20 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     dt1.inode()?.write_at(0, b"hello world")?;
     dt2.inode()?.write_at(0, b"test2")?;
+
+    // Test DBFS functionality
+    let db_path = path.join("db")?;
+    let db_dt = db_path.open(None)?;
+    let db_inode = db_dt.inode()?;
+    
+    // Create a file in DBFS
+    let db_file = db_inode.create("db_test.txt", VfsNodeType::File, "rw-rw-rw-".into(), None)?;
+    db_file.write_at(0, b"Hello from DBFS!")?;
+    
+    // Read back from DBFS
+    let mut buf = [0u8; 255];
+    let len = db_file.read_at(0, &mut buf)?;
+    println!("Read from DBFS: {:?}", std::str::from_utf8(&buf[..len])?);
 
     let proc_path = path.join("proc")?;
     let proc_dt = proc_path.open(None)?;
@@ -156,11 +178,13 @@ fn register_all_fs() {
         ExtFsType::Ext3,
         ExtFsProviderImpl,
     ));
+    let dbfs = dbfs_vfs::DBFS::new("test_db");
 
     FS.lock().insert("procfs".to_string(), procfs);
     FS.lock().insert("sysfs".to_string(), sysfs);
     FS.lock().insert("ramfs".to_string(), ramfs);
     FS.lock().insert("devfs".to_string(), devfs);
     FS.lock().insert("extfs".to_string(), extfs);
+    FS.lock().insert("dbfs".to_string(), dbfs);
     info!("register all fs");
 }
