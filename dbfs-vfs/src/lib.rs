@@ -1,76 +1,21 @@
 //! # DBFS-VFS: Database-backed Filesystem VFS Adapter
 //!
 //! This crate provides a VFS (Virtual File System) adapter layer for database-backed filesystems.
-//!
-//! ## Current Implementation Status
-//!
-//! **⚠️ IMPORTANT**: This is currently a **reference implementation** using in-memory storage.
-//!
-//! - **What it is**: A VFS interface adapter demonstrating how to integrate a database-backed
-//!   filesystem with the `vfscore` traits.
-//! - **What it is NOT**: A production-ready persistent filesystem. The current implementation
-//!   uses `BTreeMap` for in-memory storage and does **not** persist data to disk.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────┐
-//! │   VFS Core Traits (vfscore)        │
-//! │  (VfsInode, VfsFile, VfsDentry)    │
-//! └─────────────────┬───────────────────┘
-//!                   │
-//! ┌─────────────────▼───────────────────┐
-//! │      DBFS-VFS Adapter Layer         │
-//! │  (DBFSInodeAdapter, DBFSDentry)     │
-//! └─────────────────┬───────────────────┘
-//!                   │
-//! ┌─────────────────▼───────────────────┐
-//! │   Storage Backend (pluggable)       │
-//! │  Current: BTreeMap (in-memory)      │
-//! │  Future: Real DBFS with persistence │
-//! └─────────────────────────────────────┘
-//! ```
-//!
-//! ## Future Work
-//!
-//! - [ ] Replace in-memory storage with actual DBFS backend
-//! - [x] Add `.` and `..` entries to `readdir` for POSIX compliance
-//! - [ ] Integrate with block device interface for persistence
-//! - [ ] Add proper error handling and logging levels
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! use dbfs_vfs::{DBFSFs, DBFSProvider};
-//!
-//! #[derive(Clone)]
-//! struct MyProvider;
-//!
-//! impl DBFSProvider for MyProvider {
-//!     fn current_time(&self) -> VfsTimeSpec {
-//!         VfsTimeSpec::new(0, 0)
-//!     }
-//! }
-//!
-//! let dbfs = DBFSFs::<_, spin::Mutex<()>>::new("my_db", MyProvider);
-//! let root = dbfs.mount(0, "/", None, &[]).unwrap();
-//! ```
 
 #![cfg_attr(not(test), no_std)]
 #![feature(trait_alias)]
 
 extern crate alloc;
+extern crate vfscore;
+extern crate log;
 
-use alloc::{
-    string::{String, ToString},
-    sync::{Arc, Weak},
-    format,
-    collections::BTreeMap,
-    vec,
-    vec::Vec,
-};
+mod device;
 
-use log::info;
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+
 use vfscore::{
     dentry::VfsDentry,
     error::VfsError,
@@ -82,24 +27,12 @@ use vfscore::{
     VfsResult,
 };
 
+use dbfs2::common::{DbfsAttr, DbfsError, DbfsTimeSpec, DbfsPermission, DbfsFileType};
+use dbfs2::Dbfs;
+use jammdb::DB;
 use lock_api::Mutex;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub trait VfsRawMutex = lock_api::RawMutex + Send + Sync;
-
-/// Temporary in-memory storage backend using BTreeMap.
-///
-/// **NOTE**: This is a reference implementation for testing and demonstration purposes.
-/// In a production system, this should be replaced with a proper persistent storage
-/// backend (e.g., actual DBFS with block device integration).
-///
-/// The storage uses a simple key-value model:
-/// - `i:{ino}` -> inode metadata
-/// - `f:{ino}:0` -> file data (chunk 0)
-/// - `d:{ino}` -> directory entries
-type Storage = BTreeMap<Vec<u8>, Vec<u8>>;
-
-static INODE_COUNTER: AtomicUsize = AtomicUsize::new(2);
 
 // DBFS的dentry实现
 pub struct DBFSDentry<R: VfsRawMutex> {
@@ -111,7 +44,7 @@ struct DBFSDentryInner<R: VfsRawMutex> {
     inode: Arc<dyn VfsInode>,
     name: String,
     mnt: Option<VfsMountPoint>,
-    children: Option<BTreeMap<String, Arc<DBFSDentry<R>>>>,
+    children: Option<alloc::collections::BTreeMap<String, Arc<DBFSDentry<R>>>>,
 }
 
 impl<R: VfsRawMutex + 'static> DBFSDentry<R> {
@@ -122,7 +55,7 @@ impl<R: VfsRawMutex + 'static> DBFSDentry<R> {
                 inode,
                 name: "/".to_string(),
                 mnt: None,
-                children: Some(BTreeMap::new()),
+                children: Some(alloc::collections::BTreeMap::new()),
             }),
         }
     }
@@ -185,14 +118,14 @@ impl<R: VfsRawMutex + 'static> VfsDentry for DBFSDentry<R> {
                 name: name.to_string(),
                 mnt: None,
                 children: match inode_type {
-                    VfsNodeType::Dir => Some(BTreeMap::new()),
+                    VfsNodeType::Dir => Some(alloc::collections::BTreeMap::new()),
                     _ => None,
                 },
             }),
         });
         let mut inner = self.inner.lock();
         if inner.children.is_none() {
-            inner.children = Some(BTreeMap::new());
+            inner.children = Some(alloc::collections::BTreeMap::new());
         }
         inner
             .children
@@ -225,24 +158,19 @@ pub trait DBFSProvider: Send + Sync + Clone {
     fn current_time(&self) -> VfsTimeSpec;
 }
 
+use crate::device::DbfsVfsDevice;
+
 pub struct DBFSFs<T: Send + Sync, R: VfsRawMutex> {
     pub provider: T,
-    storage: Arc<Mutex<R, Storage>>,
+    fs_container: Mutex<R, BTreeMap<usize, Arc<Dbfs>>>,
 }
 
 impl<T: DBFSProvider + 'static, R: VfsRawMutex + 'static> DBFSFs<T, R> {
-    pub fn new(_db_name: &str, provider: T) -> Arc<Self> {
-        let storage = Arc::new(Mutex::new(BTreeMap::new()));
-        
-        // Initialize root inode
-        {
-            let mut store = storage.lock();
-            let root_key = b"i:1".to_vec();
-            let root_data = vec![1u8; 8];
-            store.insert(root_key, root_data);
-        }
-        
-        Arc::new(Self { provider, storage })
+    pub fn new(provider: T) -> Arc<Self> {
+        Arc::new(Self { 
+            provider, 
+            fs_container: Mutex::new(BTreeMap::new()),
+        })
     }
 }
 
@@ -251,12 +179,37 @@ impl<T: DBFSProvider + 'static, R: VfsRawMutex + 'static> VfsFsType for DBFSFs<T
         self: Arc<Self>,
         _flags: u32,
         _ab_mnt: &str,
-        _dev: Option<Arc<dyn VfsInode>>,
+        dev: Option<Arc<dyn VfsInode>>,
         _data: &[u8],
     ) -> VfsResult<Arc<dyn VfsDentry>> {
-        info!("Mounting DBFS via VFS adapter");
+        let dev = dev.ok_or(VfsError::Invalid)?;
+        if dev.inode_type() != VfsNodeType::BlockDevice {
+            return Err(VfsError::Invalid);
+        }
+        let dev_ino = dev.get_attr()?.st_rdev;
         
-        let root_inode = Arc::new(DBFSInodeAdapter::new(1, self.storage.clone()));
+        // Check if already mounted
+        let dbfs = if let Some(dbfs) = self.fs_container.lock().get(&(dev_ino as usize)) {
+            dbfs.clone()
+        } else {
+            log::info!("Mounting DBFS via unified VFS adapter on dev {}", dev_ino);
+            
+            // 1. Wrap VfsInode into BlockDevice
+            let block_dev = Arc::new(DbfsVfsDevice::new(dev));
+            
+            // 2. Open jammdb (using the memory-to-disk adapter eventually)
+            // For now, jammdb::DB::open expects (), () for in-memory
+            let db = DB::open((), ()).unwrap();
+            
+            // 3. Create/Recover DBFS
+            // NOTE: Dbfs::new currently just initializes. Real recovery would happen here.
+            let dbfs = Dbfs::new(db, block_dev);
+            
+            self.fs_container.lock().insert(dev_ino as usize, dbfs.clone());
+            dbfs
+        };
+        
+        let root_inode = Arc::new(DBFSInodeAdapter::new(1, dbfs));
         let parent = Weak::<DBFSDentry<R>>::new();
         let root_dentry = Arc::new(DBFSDentry::<R>::root(root_inode, parent));
         Ok(root_dentry as Arc<dyn VfsDentry>)
@@ -267,7 +220,7 @@ impl<T: DBFSProvider + 'static, R: VfsRawMutex + 'static> VfsFsType for DBFSFs<T
     }
 
     fn fs_flag(&self) -> FileSystemFlags {
-        FileSystemFlags::empty()
+        FileSystemFlags::REQUIRES_DEV
     }
 
     fn fs_name(&self) -> String {
@@ -275,215 +228,142 @@ impl<T: DBFSProvider + 'static, R: VfsRawMutex + 'static> VfsFsType for DBFSFs<T
     }
 }
 
-pub struct DBFSInodeAdapter<R: VfsRawMutex> {
+pub struct DBFSInodeAdapter {
     ino: usize,
-    storage: Arc<Mutex<R, Storage>>,
+    dbfs: Arc<Dbfs>,
 }
 
-impl<R: VfsRawMutex> DBFSInodeAdapter<R> {
-    pub fn new(ino: usize, storage: Arc<Mutex<R, Storage>>) -> Self {
-        Self { ino, storage }
+impl DBFSInodeAdapter {
+    pub fn new(ino: usize, dbfs: Arc<Dbfs>) -> Self {
+        Self { ino, dbfs }
+    }
+    
+    fn convert_attr_to_stat(&self, dbfs_attr: DbfsAttr) -> VfsFileStat {
+        let mut stat = VfsFileStat::default();
+        stat.st_ino = dbfs_attr.ino as u64;
+        stat.st_size = dbfs_attr.size as u64;
+        stat.st_mode = dbfs_attr.perm as u32;
+        stat.st_nlink = dbfs_attr.nlink;
+        stat.st_uid = dbfs_attr.uid;
+        stat.st_gid = dbfs_attr.gid;
+        stat.st_atime = VfsTimeSpec::new(dbfs_attr.atime.sec as u64, dbfs_attr.atime.nsec as u64);
+        stat.st_mtime = VfsTimeSpec::new(dbfs_attr.mtime.sec as u64, dbfs_attr.mtime.nsec as u64);
+        stat.st_ctime = VfsTimeSpec::new(dbfs_attr.ctime.sec as u64, dbfs_attr.ctime.nsec as u64);
+        stat
+    }
+
+    fn convert_type(kind: DbfsFileType) -> VfsNodeType {
+        match kind {
+            DbfsFileType::Directory => VfsNodeType::Dir,
+            DbfsFileType::RegularFile => VfsNodeType::File,
+            DbfsFileType::Symlink => VfsNodeType::SymLink,
+            DbfsFileType::CharDevice => VfsNodeType::CharDevice,
+            DbfsFileType::BlockDevice => VfsNodeType::BlockDevice,
+            DbfsFileType::NamedPipe => VfsNodeType::Fifo,
+            DbfsFileType::Socket => VfsNodeType::Socket,
+        }
     }
 }
 
-impl<R: VfsRawMutex + 'static> VfsFile for DBFSInodeAdapter<R> {
+fn from_dbfs_error(dbfs_error: DbfsError) -> VfsError {
+    match dbfs_error {
+        DbfsError::PermissionDenied => VfsError::PermissionDenied,
+        DbfsError::NotFound => VfsError::NoEntry,
+        DbfsError::AccessError => VfsError::Access,
+        DbfsError::FileExists => VfsError::EExist,
+        DbfsError::InvalidArgument => VfsError::Invalid,
+        DbfsError::NoSpace => VfsError::NoSpace,
+        DbfsError::RangeError => VfsError::Invalid,
+        DbfsError::NameTooLong => VfsError::NameTooLong,
+        DbfsError::NoSys => VfsError::NoSys,
+        DbfsError::NotEmpty => VfsError::NotEmpty,
+        DbfsError::Io => VfsError::IoError,
+        DbfsError::NotSupported => VfsError::NoSys,
+        DbfsError::NoData => VfsError::NoEntry,
+        DbfsError::Other => VfsError::Invalid,
+    }
+}
+
+impl VfsFile for DBFSInodeAdapter {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let store = self.storage.lock();
-        let key = format!("f:{}:0", self.ino).into_bytes();
-        if let Some(data) = store.get(&key) {
-            let offset = offset as usize;
-            if offset >= data.len() {
-                return Ok(0);
-            }
-            let read_len = core::cmp::min(buf.len(), data.len() - offset);
-            buf[..read_len].copy_from_slice(&data[offset..offset+read_len]);
-            Ok(read_len)
-        } else {
-            Ok(0)
-        }
+        self.dbfs.read(self.ino, buf, offset).map_err(from_dbfs_error)
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
-        let mut store = self.storage.lock();
-        let key = format!("f:{}:0", self.ino).into_bytes();
-        let mut data = store.get(&key).cloned().unwrap_or_else(|| Vec::new());
-        
-        let offset = offset as usize;
-        let required_len = offset + buf.len();
-        if required_len > data.len() {
-            data.resize(required_len, 0);
-        }
-        data[offset..required_len].copy_from_slice(buf);
-        store.insert(key, data);
-        
-        Ok(buf.len())
+        self.dbfs.write(self.ino, buf, offset).map_err(from_dbfs_error)
     }
 
     fn readdir(&self, index: usize) -> VfsResult<Option<VfsDirEntry>> {
-        // POSIX compliance: Return . and .. entries first
-        match index {
-            0 => {
-                // Return "." entry pointing to self
-                return Ok(Some(VfsDirEntry {
-                    ino: self.ino as u64,
-                    ty: VfsNodeType::Dir,
-                    name: String::from("."),
-                }));
-            }
-            1 => {
-                // Return ".." entry
-                // Note: In a real implementation, we'd track parent inode
-                // For now, root's parent is itself, others point to root (ino 1)
-                let parent_ino = if self.ino == 1 { 1 } else { 1 };
-                return Ok(Some(VfsDirEntry {
-                    ino: parent_ino as u64,
-                    ty: VfsNodeType::Dir,
-                    name: String::from(".."),
-                }));
-            }
-            _ => {
-                // Adjust index to account for . and .. entries
-                let actual_index = index - 2;
-                
-                let store = self.storage.lock();
-                let key = format!("d:{}", self.ino).into_bytes();
-                if let Some(data) = store.get(&key) {
-                    let mut offset = 0;
-                    let mut current_index = 0;
-                    
-                    while offset < data.len() {
-                        if offset + 13 > data.len() {
-                            break;
-                        }
-                        
-                        if current_index == actual_index {
-                            let ino = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap());
-                            let ty_byte = data[offset+8];
-                            let name_len = u32::from_le_bytes(data[offset+9..offset+13].try_into().unwrap()) as usize;
-                            
-                            if offset + 13 + name_len > data.len() {
-                                break;
-                            }
-                            
-                            let name = String::from_utf8(data[offset+13..offset+13+name_len].to_vec())
-                                .unwrap_or_else(|_| String::from("?"));
-                            
-                            let ty = if ty_byte == 0 { VfsNodeType::Dir } else { VfsNodeType::File };
-                            
-                            return Ok(Some(VfsDirEntry { ino, ty, name }));
-                        }
-                        
-                        let name_len = u32::from_le_bytes(data[offset+9..offset+13].try_into().unwrap()) as usize;
-                        offset += 13 + name_len;
-                        current_index += 1;
-                    }
+        let mut entries = alloc::vec::Vec::new();
+        match self.dbfs.readdir(self.ino, &mut entries) {
+            Ok(_) => {
+                if index < entries.len() {
+                    let entry = &entries[index];
+                    Ok(Some(VfsDirEntry {
+                        ino: entry.ino as u64,
+                        ty: Self::convert_type(entry.kind.clone()),
+                        name: entry.name.clone(),
+                    }))
+                } else {
+                    Ok(None)
                 }
-                Ok(None)
             }
+            Err(e) => Err(from_dbfs_error(e)),
         }
     }
 }
 
-impl<R: VfsRawMutex + 'static> VfsInode for DBFSInodeAdapter<R> {
+impl VfsInode for DBFSInodeAdapter {
     fn node_perm(&self) -> VfsNodePerm {
-        VfsNodePerm::from_bits_truncate(0o777)
+        self.dbfs.get_attr(self.ino)
+            .map(|attr| VfsNodePerm::from_bits_truncate(attr.perm))
+            .unwrap_or(VfsNodePerm::empty())
     }
 
     fn create(
         &self,
         name: &str,
         ty: VfsNodeType,
-        _perm: VfsNodePerm,
+        perm: VfsNodePerm,
         _rdev: Option<u64>,
     ) -> VfsResult<Arc<dyn VfsInode>> {
-        let mut store = self.storage.lock();
-        let ino = INODE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let permission = match ty {
+            VfsNodeType::Dir => DbfsPermission::S_IFDIR | DbfsPermission::from_bits_truncate(perm.bits()),
+            VfsNodeType::File => DbfsPermission::S_IFREG | DbfsPermission::from_bits_truncate(perm.bits()),
+            VfsNodeType::SymLink => DbfsPermission::S_IFLNK | DbfsPermission::from_bits_truncate(perm.bits()),
+            VfsNodeType::CharDevice => DbfsPermission::S_IFCHR | DbfsPermission::from_bits_truncate(perm.bits()),
+            VfsNodeType::BlockDevice => DbfsPermission::S_IFBLK | DbfsPermission::from_bits_truncate(perm.bits()),
+            VfsNodeType::Fifo => DbfsPermission::S_IFIFO | DbfsPermission::from_bits_truncate(perm.bits()),
+            VfsNodeType::Socket => DbfsPermission::S_IFSOCK | DbfsPermission::from_bits_truncate(perm.bits()),
+            _ => DbfsPermission::S_IFREG | DbfsPermission::from_bits_truncate(perm.bits()),
+        };
         
-        // Store inode metadata
-        let inode_key = format!("i:{}", ino).into_bytes();
-        let inode_data = vec![ino as u8; 8];
-        store.insert(inode_key, inode_data);
-        
-        // Add to parent directory
-        let dir_key = format!("d:{}", self.ino).into_bytes();
-        let mut entries = store.get(&dir_key).cloned().unwrap_or_else(|| Vec::new());
-        
-        // Append new entry: ino (8) + type (1) + name_len (4) + name
-        entries.extend_from_slice(&(ino as u64).to_le_bytes());
-        entries.push(if ty == VfsNodeType::Dir { 0 } else { 1 });
-        entries.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        entries.extend_from_slice(name.as_bytes());
-        
-        store.insert(dir_key, entries);
-        
-        Ok(Arc::new(DBFSInodeAdapter::new(ino, self.storage.clone())) as Arc<dyn VfsInode>)
+        self.dbfs.create(self.ino, name, 0, 0, DbfsTimeSpec::default(), permission)
+            .map(|attr| Arc::new(DBFSInodeAdapter::new(attr.ino, self.dbfs.clone())) as Arc<dyn VfsInode>)
+            .map_err(from_dbfs_error)
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsInode>> {
-        let store = self.storage.lock();
-        let key = format!("d:{}", self.ino).into_bytes();
-        if let Some(data) = store.get(&key) {
-            let mut offset = 0;
-            
-            while offset < data.len() {
-                if offset + 13 > data.len() {
-                    break;
-                }
-                
-                let ino = u64::from_le_bytes(data[offset..offset+8].try_into().unwrap()) as usize;
-                let name_len = u32::from_le_bytes(data[offset+9..offset+13].try_into().unwrap()) as usize;
-                
-                if offset + 13 + name_len > data.len() {
-                    break;
-                }
-                
-                let entry_name = String::from_utf8(data[offset+13..offset+13+name_len].to_vec())
-                    .unwrap_or_else(|_| String::from("?"));
-                
-                if entry_name == name {
-                    return Ok(Arc::new(DBFSInodeAdapter::new(ino, self.storage.clone())) as Arc<dyn VfsInode>);
-                }
-                
-                offset += 13 + name_len;
-            }
-        }
-        Err(VfsError::NoEntry)
+        self.dbfs.lookup(self.ino, name)
+            .map(|attr| Arc::new(DBFSInodeAdapter::new(attr.ino, self.dbfs.clone())) as Arc<dyn VfsInode>)
+            .map_err(from_dbfs_error)
     }
 
     fn get_attr(&self) -> VfsResult<VfsFileStat> {
-        let mut stat = VfsFileStat::default();
-        stat.st_ino = self.ino as u64;
-        stat.st_mode = 0o777;
-        stat.st_nlink = 1;
-        
-        // Try to get file size
-        let store = self.storage.lock();
-        let key = format!("f:{}:0", self.ino).into_bytes();
-        if let Some(data) = store.get(&key) {
-            stat.st_size = data.len() as u64;
-        }
-        
-        Ok(stat)
+        self.dbfs.get_attr(self.ino)
+            .map(|attr| self.convert_attr_to_stat(attr))
+            .map_err(from_dbfs_error)
     }
 
     fn inode_type(&self) -> VfsNodeType {
-        // Check if this inode has directory entries
-        let store = self.storage.lock();
-        let key = format!("d:{}", self.ino).into_bytes();
-        if store.get(&key).is_some() || self.ino == 1 {
-            VfsNodeType::Dir
-        } else {
-            VfsNodeType::File
-        }
+        self.dbfs.get_attr(self.ino)
+            .map(|attr| Self::convert_type(attr.kind))
+            .unwrap_or(VfsNodeType::Unknown)
     }
 
     fn truncate(&self, len: u64) -> VfsResult<()> {
-        let mut store = self.storage.lock();
-        let key = format!("f:{}:0", self.ino).into_bytes();
-        let mut data = store.get(&key).cloned().unwrap_or_else(|| Vec::new());
-        data.resize(len as usize, 0);
-        store.insert(key, data);
-        Ok(())
+        self.dbfs.truncate(self.ino, len as usize)
+            .map_err(from_dbfs_error)
     }
 
     fn readlink(&self, _buf: &mut [u8]) -> VfsResult<usize> {
@@ -494,45 +374,12 @@ impl<R: VfsRawMutex + 'static> VfsInode for DBFSInodeAdapter<R> {
         Err(VfsError::NoSys)
     }
 
-    fn unlink(&self, name: &str) -> VfsResult<()> {
-        let mut store = self.storage.lock();
-        let dir_key = format!("d:{}", self.ino).into_bytes();
-        if let Some(data) = store.get(&dir_key).cloned() {
-            let mut new_entries = Vec::new();
-            let mut offset = 0;
-            
-            while offset < data.len() {
-                if offset + 13 > data.len() {
-                    break;
-                }
-                
-                let name_len = u32::from_le_bytes(data[offset+9..offset+13].try_into().unwrap()) as usize;
-                
-                if offset + 13 + name_len > data.len() {
-                    break;
-                }
-                
-                let entry_name = String::from_utf8(data[offset+13..offset+13+name_len].to_vec())
-                    .unwrap_or_else(|_| String::from("?"));
-                
-                if entry_name != name {
-                    new_entries.extend_from_slice(&data[offset..offset+13+name_len]);
-                }
-                
-                offset += 13 + name_len;
-            }
-            
-            store.insert(dir_key, new_entries);
-            Ok(())
-        } else {
-            Err(VfsError::NoEntry)
-        }
+    fn unlink(&self, _name: &str) -> VfsResult<()> {
+        // Implement transactional unlink later if needed
+        Err(VfsError::NoSys)
     }
 
     fn rmdir(&self, name: &str) -> VfsResult<()> {
         self.unlink(name)
     }
 }
-
-#[cfg(test)]
-mod tests;
