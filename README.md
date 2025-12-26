@@ -2,19 +2,23 @@
 
 A high-performance, flexible Virtual File System (VFS) abstraction layer for Rust, designed for use in both OS kernels and userspace applications.
 
-## 🚀 Recent Update: DBFS-VFS Integration Specialized
-The **DBFS (Database-based File System)** is now fully integrated into the VFS ecosystem. DBFS provides a persistent, database-backed filesystem using `jammdb` as the storage engine. 
+## 🚀 Recent Update: DBFS-VFS Reference Implementation
+
+The **DBFS-VFS** adapter layer demonstrates how to integrate a database-backed filesystem with the VFS ecosystem.
+
+**⚠️ Current Status**: This is a **reference implementation** using in-memory storage (`BTreeMap`) for testing and demonstration purposes. It is **not** a production-ready persistent filesystem.
 
 ### Key Integration Components:
-- **DBFS-VFS Adapter Layer**: Bridges the `dbfs2` engine with `vfscore` traits.
-- **Thread-Safety (SafeDb)**: Implements a `SafeDb` wrapper to ensure `jammdb` handles are safely shared across multi-threaded VFS operations.
+- **DBFS-VFS Adapter Layer**: Bridges database-backed storage with `vfscore` traits.
+- **Thread-Safety**: Uses `lock_api::Mutex` for safe concurrent access.
 - **VfsInode & VfsFile**: Full implementation of POSIX-compliant operations including `read`, `write`, `readdir`, `lookup`, `unlink`, and `truncate`.
+- **Pluggable Storage Backend**: Designed to support future integration with persistent storage (e.g., real DBFS with block device).
 
 ## 📦 Features
 - [x] **RamFs**: In-memory filesystem.
 - [x] **DevFs**: Device node management.
 - [x] **DynFs**: Dynamic filesystem for `/proc` and `/sys` style nodes.
-- [x] **DBFS**: Persistent database-backed filesystem using KV storage.
+- [x] **DBFS-VFS**: Reference implementation of database-backed filesystem adapter (in-memory storage).
 - [x] **VfsCore**: The unified abstraction layer for mount management and path resolution.
 - [x] **ExtFs / FatFs**: Support via external providers.
 

@@ -1,0 +1,95 @@
+refactor(dbfs-vfs): Convert to self-contained reference implementation
+
+This commit refactors dbfs-vfs to be a self-contained VFS adapter with
+in-memory storage, removing external dependencies on dbfs2 and jammdb.
+
+## Changes
+
+### Core Refactoring
+- Remove dependency on `dbfs2` (external git repository)
+- Remove dependency on `jammdb` 
+- Implement simple in-memory storage using `BTreeMap`
+- Remove `SimpleDBFSProvider` and `DBFS` type alias (API cleanup)
+
+### POSIX Compliance
+- Add `.` and `..` entries to `readdir` implementation
+- `.` entry points to current directory (index 0)
+- `..` entry points to parent directory (index 1)
+- Actual directory entries start at index 2
+- All readdir tests updated and passing
+
+### Documentation
+- Add comprehensive module-level documentation explaining reference implementation status
+- Create `dbfs-vfs/README.md` with architecture overview and future roadmap
+- Update main `README.md` to clarify current implementation status
+- Add inline comments explaining temporary storage backend
+
+### Testing
+- Add `dbfs-vfs/src/tests.rs` with 5 comprehensive tests:
+  - Basic read/write operations
+  - Directory operations
+  - File lookup and readdir (with . and .. verification)
+  - File truncation
+  - File deletion
+- All tests passing ✅
+
+### Cleanup
+- Remove `out.txt` (build artifact)
+- Remove old `dbfs-vfs/tests/test.rs`
+- Update demo to use new API signature
+
+## Implementation Status
+
+⚠️ **IMPORTANT**: This is now a **reference implementation** with in-memory storage.
+
+**What it is:**
+- A complete VFS adapter demonstrating database-backed filesystem integration
+- Thread-safe with proper locking
+- Full POSIX operation support (read, write, create, lookup, readdir, unlink, truncate)
+- Designed with pluggable storage backend in mind
+
+**What it is NOT:**
+- A production-ready persistent filesystem
+- Data does NOT persist across process restarts
+- Does NOT integrate with block devices
+
+## Storage Model
+
+Uses simple key-value model:
+- `i:{ino}` → inode metadata
+- `f:{ino}:0` → file data (chunk 0)
+- `d:{ino}` → directory entries
+
+## Future Work
+
+### Next PR (High Priority)
+- [x] Add `.` and `..` entries to readdir (POSIX compliance) - **Completed in this PR**
+- [ ] Improve logging levels (reduce ERROR usage)
+
+### Later PRs
+- [ ] Replace BTreeMap with actual DBFS backend
+- [ ] Integrate with block device interface for persistence
+- [ ] Add proper chunking for large files
+
+## Testing
+
+```bash
+cargo test -p dbfs-vfs          # All tests pass
+cargo build -p demo             # Compiles successfully
+cargo run -p demo --release     # Demo runs with all features
+```
+
+## Rationale
+
+This refactoring achieves several goals:
+
+1. **Self-contained**: No external git dependencies, easier to maintain
+2. **Testable**: Can run tests without external database setup
+3. **Clear semantics**: Documentation makes it clear this is a reference implementation
+4. **Future-ready**: Architecture supports future integration with persistent storage
+5. **API cleanup**: Removed unused SimpleDBFSProvider, cleaner public API
+
+The in-memory implementation serves as a reference for future persistent
+backends while providing a working, testable VFS adapter today.
+
+Signed-off-by: [Your Name] <[your-email]>

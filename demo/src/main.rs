@@ -237,7 +237,7 @@ fn register_all_fs() {
     let sysfs = Arc::new(DynFs::<_, Mutex<()>>::new(DynFsKernelProviderImpl, "sysfs"));
     let ramfs = Arc::new(RamFs::<_, Mutex<()>>::new(RamFsProviderImpl));
     let devfs = Arc::new(DevFs::<_, Mutex<()>>::new(DevFsKernelProviderImpl));
-    let dbfs = dbfs_vfs::DBFSFs::new("test_db", DBFSProviderImpl);
+    let dbfs = dbfs_vfs::DBFSFs::<_, spin::Mutex<()>>::new("test_db", DBFSProviderImpl);
 
     FS.lock().insert("procfs".to_string(), procfs);
     FS.lock().insert("sysfs".to_string(), sysfs);
