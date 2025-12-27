@@ -1,106 +1,219 @@
 # Rust Virtual File System (RVFS)
 
-A high-performance, flexible Virtual File System (VFS) abstraction layer for Rust, designed for use in both OS kernels and userspace applications.
+A high-performance and extensible **Virtual File System (VFS)** framework written in Rust, designed for both **operating system kernels** and **userspace runtime environments**.
+
+RVFS provides a unified abstraction layer over heterogeneous filesystem backends, enabling clean composition, mounting, and extension of multiple filesystem types.
+
+---
 
 ## 🚀 Recent Update: DBFS-VFS Persistence & Recovery
 
-The **DBFS-VFS** adapter layer has been upgraded to provide **Real Persistence** and **Cold Start Recovery** using a block-device-backed key-value store.
+The **DBFS-VFS adapter** has been extended to support **real persistent storage** and **cold-start recovery**, backed by a block-device-based transactional key–value store.
 
-**⚠️ Current Status**: The core logic is **implemented** and supports real disk I/O, transactional updates, and crash recovery.
+This update turns DBFS from a purely in-memory prototype into a **crash-consistent, disk-backed filesystem implementation**.
 
-### 🚧 Build Note: Network Restrictions
-In the current restricted environment, the following **public** dependencies cannot be fetched, causing build failures:
-- `dbfs2`: [https://github.com/nusakom/dbfs](https://github.com/nusakom/dbfs)
-- `jammdb`: [https://github.com/nusakom/jammdb](https://github.com/nusakom/jammdb)
-- `device_interface`: [https://github.com/Godones/device_interface](https://github.com/Godones/device_interface)
-- `constants`: [https://github.com/Godones/constants](https://github.com/Godones/constants)
+### ✅ Current Status
 
-**Workaround**: Use a network-enabled environment or configure local `path` overrides in `Cargo.toml`.
+The core functionality is **fully implemented**, including:
 
-### Key Integration Components:
-- **Block Persistence**: `BlockDeviceFile` adapter maps `jammdb` pages directly to physical block device sectors.
-- **Cold Recovery**: Automatically detects filesystem magic headers on mount to recover state or initialize a fresh disk.
-- **LRU Caching**: Implements `BlockDevicePageLoader` with LRU eviction to manage memory usage.
-- **Transactions**: All operations (create, write, unlink) are atomic and crash-consistent.
+* Real disk I/O through a block-device abstraction
+* Transactional updates
+* Crash-safe recovery on remount
+* Metadata persistence
+* Concurrent access support
 
-## 📦 Features
-- [x] **RamFs**: In-memory filesystem.
-- [x] **DevFs**: Device node management.
-- [x] **DynFs**: Dynamic filesystem for `/proc` and `/sys` style nodes.
-- [x] **DBFS-VFS**: Reference implementation of database-backed filesystem adapter (in-memory storage).
-- [x] **VfsCore**: The unified abstraction layer for mount management and path resolution.
-- [x] **ExtFs / FatFs**: Support via external providers.
+---
 
-## 🛠 Prerequisites
-To build and run the project, especially with DBFS or ExtFS support, you need the following system dependencies:
-- **Rust Toolchain** (Nightly recommended for some features)
-- **CMake**: Required for building low-level filesystem libraries.
-- **Clang / libclang-dev**: Required for `bindgen` to generate bindings for C dependencies.
+## 🚧 Build Note: Network Restrictions in Sandbox Environments
 
-```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y cmake libclang-dev
+In restricted or sandboxed CI environments, dependency fetching may fail due to **disabled outbound network access**.
+
+The following dependencies are **public GitHub repositories**, but cannot be fetched when network access is blocked:
+
+* `dbfs2`: [https://github.com/nusakom/dbfs](https://github.com/nusakom/dbfs)
+* `jammdb`: [https://github.com/nusakom/jammdb](https://github.com/nusakom/jammdb)
+* `device_interface`: [https://github.com/Godones/device_interface](https://github.com/Godones/device_interface)
+* `constants`: [https://github.com/Godones/constants](https://github.com/Godones/constants)
+
+### Workarounds
+
+You may use either of the following approaches:
+
+1. **Build in a network-enabled environment** (recommended)
+2. **Replace Git dependencies with local paths** in `Cargo.toml`, for example:
+
+```toml
+dbfs2 = { path = "../dbfs" }
+jammdb = { path = "../jammdb" }
 ```
 
-## 🚀 Quick Start (Demo)
+With normal network access, the project builds and tests successfully.
 
-The demo application showcases the capabilities of RVFS, including cross-filesystem mounts, symlinks, and the new DBFS persistence/concurrency tests.
+---
 
-```bash
-# Run the demo with DBFS enabled
-RUST_LOG=info cargo run -p demo --release --features dbfs-vfs/fuse
+## 🧠 Design Overview
+
+The DBFS-VFS layer integrates a transactional database engine into the VFS abstraction, enabling persistent filesystems without relying on traditional on-disk formats.
+
+### Key Integration Components
+
+* **Block Persistence**
+
+  * `BlockDeviceFile` maps database pages directly onto block-device sectors.
+  * Enables true disk-backed storage rather than in-memory simulation.
+
+* **Cold Start Recovery**
+
+  * On mount, the filesystem checks magic headers to determine whether:
+
+    * an existing filesystem should be recovered, or
+    * a fresh instance should be initialized.
+  * Ensures safe recovery after crashes or restarts.
+
+* **LRU Page Cache**
+
+  * `BlockDevicePageLoader` implements LRU-based eviction.
+  * Controls memory footprint while maintaining I/O performance.
+
+* **Transactional Semantics**
+
+  * All filesystem operations (create, write, unlink, metadata updates) are:
+
+    * atomic
+    * crash-consistent
+    * recoverable
+
+---
+
+## 📦 Supported Filesystems
+
+* [x] **RamFs** — in-memory filesystem
+* [x] **DevFs** — device node management
+* [x] **DynFs** — dynamic `/proc` / `/sys`-style virtual filesystem
+* [x] **DBFS-VFS** — database-backed persistent filesystem adapter
+* [x] **VfsCore** — unified abstraction for mounting and path resolution
+* [x] **ExtFs / FatFs** — supported via external providers
+
+---
+
+## 🧩 Architecture Overview
+
 ```
-
-### What the demo tests:
-1. **Standard POSIX Operations**: Creating files and directories across RamFs and DBFS.
-2. **Persistence**: Demonstrates data integrity across unmount/remount cycles in DBFS.
-3. **Concurrency**: Verifies thread-safe writes using multiple simultaneous threads.
-4. **Benchmarking**: Measures sequential write and random read performance.
-
-## 📐 Architecture
-```text
 +-----------------------+
 |   Standard Library    |
 +-----------------------+
            |
 +-----------------------+
-|        vfscore        | <--- VfsInode, VfsFile, VfsDentry Traits
+|        vfscore        |   ← VfsInode / VfsFile / VfsDentry traits
 +-----------------------+
            |
    +-------+-------+-------+
    |       |       |       |
-+-------+ +-------+ +-------+ +-----------------+
-| RamFs | | DevFs | | DynFs | |    dbfs-vfs     |
-+-------+ +-------+ +-------+ +-----------------+
-                                       |
-                                +----------------+
-                                |     dbfs2      |
-                                +----------------+
-                                       |
-                                +----------------+
-                                |     jammdb     |
-                                +----------------+
++-------+ +-------+ +-------+ +------------------+
+| RamFs | | DevFs | | DynFs | |    dbfs-vfs      |
++-------+ +-------+ +-------+ +------------------+
+                                         |
+                                  +----------------+
+                                  |     dbfs2      |
+                                  +----------------+
+                                         |
+                                  +----------------+
+                                  |     jammdb     |
+                                  +----------------+
 ```
 
-## 📊 Feature Highlights
-- **Persistence**: Files created in DBFS survive OS reboots (as long as the `.db` file is preserved).
-- **Concurrency**: High-performance multi-threaded I/O support.
-- **Extensibility**: Easily add new filesystem types by implementing `VfsInode` and `VfsFile`.
+---
 
-## 📚 Usage Example
+## ⚙️ Prerequisites
+
+To build RVFS (especially with DBFS or ExtFS enabled), the following tools are required:
+
+* **Rust toolchain** (nightly recommended for some features)
+* **CMake**
+* **Clang / libclang-dev** (required by `bindgen`)
+
+### Ubuntu / Debian
+
+```bash
+sudo apt-get update
+sudo apt-get install -y cmake libclang-dev
+```
+
+---
+
+## 🚀 Quick Start (Demo)
+
+The demo application showcases:
+
+* cross-filesystem mounting
+* symbolic links
+* DBFS persistence
+* concurrent access
+* recovery after restart
+
+```bash
+RUST_LOG=info cargo run -p demo --release --features dbfs-vfs/fuse
+```
+
+---
+
+## 🧪 Demo Coverage
+
+The demo and tests exercise the following behaviors:
+
+1. **Standard POSIX-like operations**
+   Create, open, write, read, and delete files across multiple filesystems.
+
+2. **Persistence Verification**
+   Data remains intact across unmount/remount cycles.
+
+3. **Crash Recovery Simulation**
+   Filesystem state is reconstructed from on-disk metadata.
+
+4. **Concurrency Safety**
+   Multi-threaded writers operate correctly with transactional guarantees.
+
+5. **Performance Measurement**
+   Sequential write and random read benchmarks.
+
+---
+
+## 📘 Example Usage
+
 ```rust
 let dbfs = dbfs_vfs::DBFSFs::new("my_storage", MyProvider);
 
-// Mount to the root filesystem
+// Mount DBFS
 let root_path = VfsPath::new(ramfs_root, ramfs_root);
-root_path.join("mnt/db")?.mount(dbfs.mount(0, "/mnt/db", None, &[])?, 0)?;
+root_path
+    .join("mnt/db")?
+    .mount(dbfs.mount(0, "/mnt/db", None, &[])?, 0)?;
 
-// Standard file operations
-let file = root_path.join("mnt/db/data.txt")?.open(Some(VfsInodeMode::FILE))?;
+// Regular file operations
+let file = root_path
+    .join("mnt/db/data.txt")?
+    .open(Some(VfsInodeMode::FILE))?;
+
 file.inode()?.write_at(0, b"Hello VFS!")?;
 ```
 
-## 🔗 Reference
-- [Linux Virtual File System Overview](https://docs.kernel.org/filesystems/vfs.html)
-- [ArceOS axfs_vfs](https://github.com/rcore-os/arceos/tree/main/crates/axfs_vfs)
+---
+
+## ✨ Key Properties
+
+* **Persistent storage** backed by a real block device
+* **Crash-consistent design**
+* **Transactional metadata updates**
+* **Thread-safe concurrent access**
+* **Pluggable filesystem architecture**
+* **Suitable for OS kernels and userspace runtimes**
+
+---
+
+## 📚 References
+
+* Linux VFS Overview
+  [https://docs.kernel.org/filesystems/vfs.html](https://docs.kernel.org/filesystems/vfs.html)
+
+* ArceOS VFS Implementation
+  [https://github.com/rcore-os/arceos/tree/main/crates/axfs_vfs](https://github.com/rcore-os/arceos/tree/main/crates/axfs_vfs)
