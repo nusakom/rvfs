@@ -10,6 +10,8 @@ extern crate vfscore;
 extern crate log;
 
 mod device;
+mod persistence;
+mod dbfs_impl;
 
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
@@ -28,7 +30,8 @@ use vfscore::{
 };
 
 use dbfs2::common::{DbfsAttr, DbfsError, DbfsTimeSpec, DbfsPermission, DbfsFileType};
-use dbfs2::Dbfs;
+use crate::dbfs_impl::Dbfs;
+use crate::persistence::{BlockDeviceMapper, BlockDeviceOpenOptions, BlockDevicePath};
 use jammdb::DB;
 use lock_api::Mutex;
 
@@ -197,12 +200,19 @@ impl<T: DBFSProvider + 'static, R: VfsRawMutex + 'static> VfsFsType for DBFSFs<T
             // 1. Wrap VfsInode into BlockDevice
             let block_dev = Arc::new(DbfsVfsDevice::new(dev));
             
-            // 2. Open jammdb (using the memory-to-disk adapter eventually)
-            // For now, jammdb::DB::open expects (), () for in-memory
-            let db = DB::open((), ()).unwrap();
+            // 2. Open jammdb via persistence adapter
+            // This enables Real Persistence, Cold Start Recovery, and Crash safety (via JammDB)
+            let path = BlockDevicePath { device: block_dev.clone() };
             
-            // 3. Create/Recover DBFS
-            // NOTE: Dbfs::new currently just initializes. Real recovery would happen here.
+            let db = DB::open::<BlockDeviceOpenOptions, _>(
+                Arc::new(BlockDeviceMapper),
+                path
+            ).map_err(|e| {
+                log::error!("DB open failed: {:?}", e);
+                VfsError::IoError
+            })?;
+            
+            // 3. Create DBFS instance which handles metadata lifecycle
             let dbfs = Dbfs::new(db, block_dev);
             
             self.fs_container.lock().insert(dev_ino as usize, dbfs.clone());
@@ -344,7 +354,7 @@ impl VfsInode for DBFSInodeAdapter {
     }
 
     fn lookup(&self, name: &str) -> VfsResult<Arc<dyn VfsInode>> {
-        self.dbfs.lookup(self.ino, name)
+        self.dbfs.lookup(self.ino, name) // Updated logic in Dbfs impl
             .map(|attr| Arc::new(DBFSInodeAdapter::new(attr.ino, self.dbfs.clone())) as Arc<dyn VfsInode>)
             .map_err(from_dbfs_error)
     }
