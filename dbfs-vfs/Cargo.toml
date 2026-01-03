@@ -1,0 +1,13 @@
+[package]
+name = "dbfs-vfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vfscore = { path = "../vfscore" }
+dbfs2 = { git = "ssh://git@github.com/nusakom/dbfs.git", optional = true }
+log = "0.4"
+
+[features]
+default = []
+dbfs = ["dep:dbfs2"]
